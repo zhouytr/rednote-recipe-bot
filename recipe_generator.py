@@ -26,7 +26,10 @@ HISTORY_FILE = Path("./history.json")
 IMAGE_WIDTH = 1080
 IMAGE_HEIGHT = 1440
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url="https://api.gptsapi.net/v1"  # 加上这一行！
+)
 
 # ============ 菜谱历史管理 ============
 
