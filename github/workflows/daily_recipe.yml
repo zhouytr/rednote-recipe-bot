@@ -1,0 +1,37 @@
+name: 每日菜谱自动生成
+
+on:
+  schedule:
+    - cron: '40 0 * * *'  # UTC 0:40 = 北京 8:40
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r requirements.txt
+
+      - name: 生成今日菜谱
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          PUBLISH_STRATEGY: ${{ secrets.PUBLISH_STRATEGY }}
+        run: python recipe_generator.py
+
+      - name: 提交历史记录防重复
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'bot@github.com'
+
+          git add history.json
+
+          git diff --staged --quiet || git commit -m "更新菜谱历史"
+
+          git push
