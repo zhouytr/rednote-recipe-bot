@@ -116,37 +116,55 @@ def generate_recipe(used_dishes: list, max_retries: int = 3) -> dict:
 
 # ============ 图片生成 ============
 
-def generate_recipe_image(recipe: dict) -> bytes:
-    """使用代理平台支持的图片模型生成菜谱图片"""
+def generate_recipe_image(recipe: dict, max_retries: int = 3) -> bytes:
+    """使用代理平台支持的图片模型生成菜谱图片，增加 Base64 兼容逻辑"""
     dish_name = recipe["dish_name"]
     
-    # 构建详细的图片提示词
+    # 1. 这里的模型名称换成你测试通过的那个
+    model_name = "gpt-image-1.5" 
+    
     image_prompt = f"""Professional Chinese food photography of {dish_name} (a Chinese home-cooked dish).
 Beautiful ceramic bowl/plate presentation, vibrant and appetizing colors, 
 steam rising, garnished with green onions or herbs,
 warm restaurant lighting, shallow depth of field, 
 shot from slightly above at 45-degree angle,
-include some ingredients scattered artfully around the dish,
 red and orange tones in sauce, ultra-realistic food photography,
 magazine quality, 4K resolution.
-IMPORTANT: Do NOT include any text, letters, watermarks, menus, or words anywhere in the image.""" 
-    # 🌟 增加最后一句英文，严禁图片中出现乱码文字
+IMPORTANT: Do NOT include any text, letters, or words in the image."""
     
-    print(f"🎨 正在请求模型 [gpt-image-2-plus] 为 {dish_name} 生成竖版图片...")
-    
-    response = client.images.generate(
-        model="gpt-image-2-plus",  # 代理平台支持的模型名称
-        prompt=image_prompt,
-        size="1024x1792",          # 恢复竖版比例 (3:4 或 9:16 的近似值)
-        n=1,
-    )
-    
-    image_url = response.data[0].url
-    print(f"🔗 图片生成成功，下载中: {image_url[:50]}...")
-    
-    # 下载图片
-    img_response = requests.get(image_url, timeout=60)
-    return img_response.content
+    for attempt in range(max_retries):
+        try:
+            print(f"🎨 正在使用 [{model_name}] 为 {dish_name} 生成图片 (第 {attempt + 1}/{max_retries} 次尝试)...")
+            
+            response = client.images.generate(
+                model=model_name,
+                prompt=image_prompt,
+                size="1024x1024", # 如果该模型不支持竖版，先用 1024x1024 保证成功率
+                n=1,
+            )
+            
+            # 2. 核心修改：增加对两种返回格式的兼容解析
+            image_url = getattr(response.data[0], 'url', None)
+            image_b64 = getattr(response.data[0], 'b64_json', None)
+            
+            if image_url and image_url.startswith('http'):
+                print(f"🔗 拿到图片 URL，正在下载...")
+                img_response = requests.get(image_url, timeout=60)
+                return img_response.content
+            
+            elif image_b64:
+                print("📜 拿到 Base64 数据，正在解码...")
+                import base64
+                return base64.b64decode(image_b64)
+            
+            else:
+                raise Exception("API 返回的数据中既没有有效 URL 也没有 Base64 数据")
+            
+        except Exception as e:
+            print(f"⚠️ 第 {attempt + 1} 次生成失败: {e}")
+            if attempt == max_retries - 1:
+                raise Exception("图片服务多次重试均失败，请检查模型名称或平台状态。")
+            time.sleep(5)
 
 # ============ 文案整理 ============
 
