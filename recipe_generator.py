@@ -143,14 +143,13 @@ def generate_recipe_image(recipe: dict, max_retries: int = 3) -> bytes:
             
             # 增加超时时间到 120 秒，因为生图很慢
             response = requests.post(api_url, headers=headers, json=payload, timeout=120)
-            
+            result = response.json()
+            print(f"DEBUG - 平台返回的完整JSON: {result}") # 加上这一行
             # 如果状态码不是 200，打印详细内容
             if response.status_code != 200:
                 print(f"❌ 接口报错! 状态码: {response.status_code}")
                 print(f"❌ 响应内容: {response.text}")
                 continue # 进入下一次重试
-
-            result = response.json()
             
             # --- 关键解析逻辑开始 ---
             # 根据该平台可能的返回结构，按优先级尝试获取数据
