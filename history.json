@@ -22,5 +22,11 @@
     "dish_name": "土豆烧排骨",
     "image_path": "output/2026-05-12_土豆烧排骨.png",
     "post_path": "output/2026-05-12_土豆烧排骨_post.txt"
+  },
+  {
+    "date": "2026-05-12",
+    "dish_name": "青椒炒肉丝",
+    "image_path": "生成失败",
+    "post_path": "output/2026-05-12_青椒炒肉丝_post.txt"
   }
 ]
