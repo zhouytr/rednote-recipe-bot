@@ -10,6 +10,7 @@
 
 import os
 import json
+import base64
 import random
 import datetime
 import time
@@ -117,53 +118,62 @@ def generate_recipe(used_dishes: list, max_retries: int = 3) -> dict:
 # ============ 图片生成 ============
 
 def generate_recipe_image(recipe: dict, max_retries: int = 3) -> bytes:
-    """使用代理平台支持的图片模型生成菜谱图片，增加 Base64 兼容逻辑"""
+    """使用中转站自定义 API 接口生成菜谱图片"""
     dish_name = recipe["dish_name"]
     
-    # 1. 这里的模型名称换成你测试通过的那个
-    model_name = "gpt-image-1.5" 
-    
-    image_prompt = f"""Professional Chinese food photography of {dish_name} (a Chinese home-cooked dish).
-Beautiful ceramic bowl/plate presentation, vibrant and appetizing colors, 
-steam rising, garnished with green onions or herbs,
-warm restaurant lighting, shallow depth of field, 
-shot from slightly above at 45-degree angle,
-red and orange tones in sauce, ultra-realistic food photography,
-magazine quality, 4K resolution.
-IMPORTANT: Do NOT include any text, letters, or words in the image."""
-    
+    # 1. 配置自定义接口地址和 Header
+    # 这里的 URL 就是你提供的 curl 里的地址
+    api_url = "https://api.gptsapi.net/api/v3/openai/gpt-image-2-plus/text-to-image"
+    headers = {
+        'Authorization': f'Bearer {OPENAI_API_KEY}', # 确保这里读取的是你的真实 Key
+        'Content-Type': 'application/json'
+    }
+
+    # 2. 构建图片提示词
+    image_prompt = f"Professional Chinese food photography of {dish_name}. Beautiful presentation, vibrant colors, warm lighting, 4K resolution, no text."
+
+    # 3. 构建请求体 (根据你提供的 curl 格式)
+    payload = {
+        "prompt": image_prompt,
+        "aspect_ratio": "1:1",  # 如果支持竖版可尝试 "9:16"
+        "output_format": "png"
+    }
+
     for attempt in range(max_retries):
         try:
-            print(f"🎨 正在使用 [{model_name}] 为 {dish_name} 生成图片 (第 {attempt + 1}/{max_retries} 次尝试)...")
+            print(f"🎨 正在通过自定义接口为 {dish_name} 生成图片 (第 {attempt + 1}/{max_retries} 次尝试)...")
             
-            response = client.images.generate(
-                model=model_name,
-                prompt=image_prompt,
-                size="1024x1024", # 如果该模型不支持竖版，先用 1024x1024 保证成功率
-                n=1,
-            )
+            response = requests.post(api_url, headers=headers, json=payload, timeout=90)
             
-            # 2. 核心修改：增加对两种返回格式的兼容解析
-            image_url = getattr(response.data[0], 'url', None)
-            image_b64 = getattr(response.data[0], 'b64_json', None)
+            # 如果请求失败，打印错误信息
+            if response.status_code != 200:
+                print(f"❌ 接口请求失败，状态码: {response.status_code}, 响应: {response.text}")
+                raise Exception(f"API Error {response.status_code}")
+
+            result = response.json()
             
-            if image_url and image_url.startswith('http'):
+            # 4. 解析结果 (根据此类接口惯例，通常在 data 或 url 字段中)
+            # 注意：这里需要根据你运行 curl 得到的实际 JSON 结构微调
+            # 如果返回的是 {"url": "http..."}
+            image_url = result.get("url") or result.get("data", [{}])[0].get("url")
+            
+            if image_url:
                 print(f"🔗 拿到图片 URL，正在下载...")
-                img_response = requests.get(image_url, timeout=60)
-                return img_response.content
-            
-            elif image_b64:
-                print("📜 拿到 Base64 数据，正在解码...")
-                import base64
-                return base64.b64decode(image_b64)
-            
+                img_data = requests.get(image_url, timeout=60).content
+                return img_data
             else:
-                raise Exception("API 返回的数据中既没有有效 URL 也没有 Base64 数据")
-            
+                # 如果返回的是 Base64 (有些自定义接口直接返回 b64_json)
+                image_b64 = result.get("b64_json") or result.get("image_base64")
+                if image_b64:
+                    print("📜 拿到 Base64 数据，正在解码...")
+                    return base64.b64decode(image_b64)
+                
+            raise Exception("接口返回成功但未找到图片数据")
+
         except Exception as e:
             print(f"⚠️ 第 {attempt + 1} 次生成失败: {e}")
             if attempt == max_retries - 1:
-                raise Exception("图片服务多次重试均失败，请检查模型名称或平台状态。")
+                raise Exception("自定义图片接口多次尝试均失败。")
             time.sleep(5)
 
 # ============ 文案整理 ============
