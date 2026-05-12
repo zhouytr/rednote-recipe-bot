@@ -12,6 +12,7 @@ import os
 import json
 import random
 import datetime
+import time
 import requests
 from pathlib import Path
 from openai import OpenAI
@@ -51,8 +52,8 @@ def get_used_dishes(history: list) -> list:
 
 # ============ 菜谱生成 ============
 
-def generate_recipe(used_dishes: list) -> dict:
-    """使用 GPT-4o 生成今日菜谱内容"""
+def generate_recipe(used_dishes: list, max_retries: int = 3) -> dict:
+    """使用 GPT-4o 生成今日菜谱内容，包含重试机制与 JSON 模式限制"""
     used_str = "、".join(used_dishes[-30:]) if used_dishes else "无"
     
     prompt = f"""你是一位专业的家常菜厨师，请生成一道适合普通家庭制作的中国家常菜菜谱。
@@ -61,10 +62,7 @@ def generate_recipe(used_dishes: list) -> dict:
 1. 不能是以下已使用过的菜：{used_str}
 2. 食材简单易得，步骤清晰
 3. 适合小红书风格（活泼、接地气）
-4. ⚠️ 必须严格遵守标准的单行 JSON 格式！如果 JSON 的字符串（如文案正文）中需要换行，请务必使用转义字符 \\n ，绝对不能在双引号内部直接按回车键换行！
-
-请严格按照以下 JSON 格式返回，不要有任何其他文字：
-...
+4. ⚠️ 必须严格遵守标准的单行 JSON 对象格式！如果 JSON 的字符串（如文案正文）中需要换行，请务必使用转义字符 \\n ，绝对不能在双引号内部直接按回车键换行！
 
 请严格按照以下 JSON 格式返回，不要有任何其他文字：
 {{
@@ -72,33 +70,49 @@ def generate_recipe(used_dishes: list) -> dict:
   "dish_emoji": "相关emoji",
   "tagline": "一句话吸引人的描述（15字以内）",
   "ingredients": [
-    {{"name": "食材名", "amount": "用量"}},
-    ...
+    {{"name": "食材名", "amount": "用量"}}
   ],
   "steps": [
-    {{"step": 1, "action": "步骤标题", "detail": "具体描述"}},
-    ...
+    {{"step": 1, "action": "步骤标题", "detail": "具体描述"}}
   ],
   "tips": ["小贴士1", "小贴士2"],
-  "tags": ["#标签1", "#标签2", "#标签3", "#标签4", "#标签5"],
+  "tags": ["#标签1", "#标签2", "#标签3"],
   "xiaohongshu_title": "小红书标题（含emoji，吸引人，20字以内）",
   "xiaohongshu_body": "小红书正文（300字左右，活泼风格，包含分步说明和最后的互动引导）"
 }}"""
 
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.9,
-    )
-    
-    raw = response.choices[0].message.content.strip()
-    # 去除可能的 markdown 代码块标识
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    
-    return json.loads(raw.strip())
+    # 加入重试机制
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                response_format={ "type": "json_object" }, # 🌟 强制使用 JSON 模式
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.9,
+            )
+            
+            raw = response.choices[0].message.content.strip()
+            
+            # 去除可能的 markdown 代码块标识 (双重保险)
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.lower().startswith("json"):
+                    raw = raw[4:]
+            
+            return json.loads(raw.strip())
+            
+        except json.JSONDecodeError as e:
+            print(f"⚠️ 第 {attempt + 1} 次 JSON 解析失败，格式异常: {e}")
+            print(f"异常内容片段: {raw[:100]}...")
+            if attempt == max_retries - 1:
+                raise Exception("多次重试后仍然无法生成正确的 JSON，请检查 API 或 Prompt。")
+            time.sleep(2) # 失败后稍微等待再重试
+            
+        except Exception as e:
+            print(f"⚠️ 第 {attempt + 1} 次 API 请求发生错误: {e}")
+            if attempt == max_retries - 1:
+                raise Exception("API 请求多次失败，请检查网络或余额。")
+            time.sleep(3)
 
 # ============ 图片生成 ============
 
@@ -114,8 +128,10 @@ warm restaurant lighting, shallow depth of field,
 shot from slightly above at 45-degree angle,
 include some ingredients scattered artfully around the dish,
 red and orange tones in sauce, ultra-realistic food photography,
-magazine quality, 4K resolution."""
-
+magazine quality, 4K resolution.
+IMPORTANT: Do NOT include any text, letters, watermarks, menus, or words anywhere in the image.""" 
+    # 🌟 增加最后一句英文，严禁图片中出现乱码文字
+    
     print(f"🎨 正在请求模型 [gpt-image-2-plus] 为 {dish_name} 生成竖版图片...")
     
     response = client.images.generate(
