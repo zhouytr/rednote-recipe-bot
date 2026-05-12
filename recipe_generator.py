@@ -118,60 +118,73 @@ def generate_recipe(used_dishes: list, max_retries: int = 3) -> dict:
 # ============ 图片生成 ============
 
 def generate_recipe_image(recipe: dict, max_retries: int = 3) -> bytes:
-    """使用中转站自定义 API 接口生成菜谱图片"""
+    """针对 gptsapi 自定义 v3 接口的专用生成函数"""
     dish_name = recipe["dish_name"]
     
-    # 1. 配置自定义接口地址和 Header
-    # 这里的 URL 就是你提供的 curl 里的地址
+    # 1. 确保 URL 和 Header 准确
     api_url = "https://api.gptsapi.net/api/v3/openai/gpt-image-2-plus/text-to-image"
     headers = {
-        'Authorization': f'Bearer {OPENAI_API_KEY}', # 确保这里读取的是你的真实 Key
+        'Authorization': f'Bearer {OPENAI_API_KEY}', 
         'Content-Type': 'application/json'
     }
 
-    # 2. 构建图片提示词
-    image_prompt = f"Professional Chinese food photography of {dish_name}. Beautiful presentation, vibrant colors, warm lighting, 4K resolution, no text."
+    # 2. 优化 Prompt (尽量简洁，避免触发风控)
+    image_prompt = f"Professional Chinese food photography of {dish_name}, delicious, warm lighting, 4K."
 
-    # 3. 构建请求体 (根据你提供的 curl 格式)
     payload = {
         "prompt": image_prompt,
-        "aspect_ratio": "1:1",  # 如果支持竖版可尝试 "9:16"
+        "aspect_ratio": "1:1",
         "output_format": "png"
     }
 
     for attempt in range(max_retries):
         try:
-            print(f"🎨 正在通过自定义接口为 {dish_name} 生成图片 (第 {attempt + 1}/{max_retries} 次尝试)...")
+            print(f"🎨 正在请求自定义接口 (第 {attempt + 1}/{max_retries})...")
             
-            response = requests.post(api_url, headers=headers, json=payload, timeout=90)
+            # 增加超时时间到 120 秒，因为生图很慢
+            response = requests.post(api_url, headers=headers, json=payload, timeout=120)
             
-            # 如果请求失败，打印错误信息
+            # 如果状态码不是 200，打印详细内容
             if response.status_code != 200:
-                print(f"❌ 接口请求失败，状态码: {response.status_code}, 响应: {response.text}")
-                raise Exception(f"API Error {response.status_code}")
+                print(f"❌ 接口报错! 状态码: {response.status_code}")
+                print(f"❌ 响应内容: {response.text}")
+                continue # 进入下一次重试
 
             result = response.json()
             
-            # 4. 解析结果 (根据此类接口惯例，通常在 data 或 url 字段中)
-            # 注意：这里需要根据你运行 curl 得到的实际 JSON 结构微调
-            # 如果返回的是 {"url": "http..."}
-            image_url = result.get("url") or result.get("data", [{}])[0].get("url")
+            # --- 关键解析逻辑开始 ---
+            # 根据该平台可能的返回结构，按优先级尝试获取数据
+            image_url = None
+            image_b64 = None
+
+            # 结构 1: 直接在根目录有 url (你提供的 curl 猜测)
+            # 结构 2: 在 data 数组里 (标准 OpenAI 风格)
+            # 结构 3: 在 images 数组里 (某些插件风格)
+            if "url" in result:
+                image_url = result["url"]
+            elif "data" in result and len(result["data"]) > 0:
+                image_url = result["data"][0].get("url")
+                image_b64 = result["data"][0].get("b64_json")
+            elif "images" in result and len(result["images"]) > 0:
+                image_url = result["images"][0] # 某些接口直接返回链接数组
             
-            if image_url:
-                print(f"🔗 拿到图片 URL，正在下载...")
+            # --- 执行获取 ---
+            if image_url and str(image_url).startswith('http'):
+                print(f"🔗 拿到图片链接，正在下载: {image_url[:50]}...")
                 img_data = requests.get(image_url, timeout=60).content
                 return img_data
+            
+            elif image_b64:
+                print("📜 拿到 Base64 编码数据，正在解码...")
+                import base64
+                return base64.b64decode(image_b64)
+            
             else:
-                # 如果返回的是 Base64 (有些自定义接口直接返回 b64_json)
-                image_b64 = result.get("b64_json") or result.get("image_base64")
-                if image_b64:
-                    print("📜 拿到 Base64 数据，正在解码...")
-                    return base64.b64decode(image_b64)
-                
-            raise Exception("接口返回成功但未找到图片数据")
+                print(f"❓ 解析失败，未找到图片字段。原始响应: {result}")
+                raise Exception("未找到有效的图片数据字段")
 
         except Exception as e:
-            print(f"⚠️ 第 {attempt + 1} 次生成失败: {e}")
+            print(f"⚠️ 第 {attempt + 1} 次生成捕获到异常: {str(e)}")
             if attempt == max_retries - 1:
                 raise Exception("自定义图片接口多次尝试均失败。")
             time.sleep(5)
