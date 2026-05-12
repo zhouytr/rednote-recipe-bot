@@ -1,1 +1,0 @@
-# rednote-recipe-bot
