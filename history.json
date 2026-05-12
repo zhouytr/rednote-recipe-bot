@@ -16,5 +16,11 @@
     "dish_name": "蒜蓉空心菜",
     "image_path": "output/2026-05-12_蒜蓉空心菜.png",
     "post_path": "output/2026-05-12_蒜蓉空心菜_post.txt"
+  },
+  {
+    "date": "2026-05-12",
+    "dish_name": "土豆烧排骨",
+    "image_path": "output/2026-05-12_土豆烧排骨.png",
+    "post_path": "output/2026-05-12_土豆烧排骨_post.txt"
   }
 ]
