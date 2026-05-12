@@ -3,7 +3,7 @@
 功能：
 - 每日 8:40 自动触发
 - 生成不重复的家常菜菜谱
-- 使用 OpenAI GPT-4o image 生成图片
+- 使用 代理平台 图像模型生成图片
 - 生成小红书格式文案
 - 输出内容供发布使用
 """
@@ -13,22 +13,19 @@ import json
 import random
 import datetime
 import requests
-import base64
 from pathlib import Path
 from openai import OpenAI
 
 # ============ 配置区 ============
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "your_openai_api_key_here")
+# 优先从环境变量读取 API Key
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OUTPUT_DIR = Path("./output")
 HISTORY_FILE = Path("./history.json")
 
-# 小红书图片尺寸（手机竖版 3:4）
-IMAGE_WIDTH = 1080
-IMAGE_HEIGHT = 1440
-
+# 初始化 OpenAI 客户端 (使用中转代理地址)
 client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    base_url="https://api.gptsapi.net/v1"  # 加上这一行！
+    api_key=OPENAI_API_KEY,
+    base_url="https://api.gptsapi.net/v1" 
 )
 
 # ============ 菜谱历史管理 ============
@@ -37,7 +34,10 @@ def load_history() -> list:
     """加载历史菜谱记录"""
     if HISTORY_FILE.exists():
         with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                return []
     return []
 
 def save_history(history: list):
@@ -52,7 +52,7 @@ def get_used_dishes(history: list) -> list:
 # ============ 菜谱生成 ============
 
 def generate_recipe(used_dishes: list) -> dict:
-    """使用 GPT-4 生成今日菜谱"""
+    """使用 GPT-4o 生成今日菜谱内容"""
     used_str = "、".join(used_dishes[-30:]) if used_dishes else "无"
     
     prompt = f"""你是一位专业的家常菜厨师，请生成一道适合普通家庭制作的中国家常菜菜谱。
@@ -78,8 +78,7 @@ def generate_recipe(used_dishes: list) -> dict:
   "tips": ["小贴士1", "小贴士2"],
   "tags": ["#标签1", "#标签2", "#标签3", "#标签4", "#标签5"],
   "xiaohongshu_title": "小红书标题（含emoji，吸引人，20字以内）",
-  "xiaohongshu_body": "小红书正文（300字左右，活泼风格，包含分步说明和最后的互动引导）",
-  "image_prompt_en": "A mouth-watering Chinese home-cooked dish photo of [dish], overhead flat lay shot on white ceramic plate, garnished beautifully, vibrant colors, food photography style, warm lighting, 4K quality"
+  "xiaohongshu_body": "小红书正文（300字左右，活泼风格，包含分步说明和最后的互动引导）"
 }}"""
 
     response = client.chat.completions.create(
@@ -89,7 +88,7 @@ def generate_recipe(used_dishes: list) -> dict:
     )
     
     raw = response.choices[0].message.content.strip()
-    # 去除可能的 markdown 代码块
+    # 去除可能的 markdown 代码块标识
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -100,7 +99,7 @@ def generate_recipe(used_dishes: list) -> dict:
 # ============ 图片生成 ============
 
 def generate_recipe_image(recipe: dict) -> bytes:
-    """使用 DALL-E 3 生成菜谱图片"""
+    """使用代理平台支持的图片模型生成菜谱图片"""
     dish_name = recipe["dish_name"]
     
     # 构建详细的图片提示词
@@ -113,21 +112,23 @@ include some ingredients scattered artfully around the dish,
 red and orange tones in sauce, ultra-realistic food photography,
 magazine quality, 4K resolution."""
 
+    print(f"🎨 正在请求模型 [gpt-image-2-plus] 为 {dish_name} 生成竖版图片...")
+    
     response = client.images.generate(
-        model="dall-e-3",
+        model="gpt-image-2-plus",  # 代理平台支持的模型名称
         prompt=image_prompt,
-        size="1024x1792",  # 竖版接近手机尺寸
-        quality="hd",
+        size="1024x1792",          # 恢复竖版比例 (3:4 或 9:16 的近似值)
         n=1,
     )
     
     image_url = response.data[0].url
+    print(f"🔗 图片生成成功，下载中: {image_url[:50]}...")
     
     # 下载图片
-    img_response = requests.get(image_url, timeout=30)
+    img_response = requests.get(image_url, timeout=60)
     return img_response.content
 
-# ============ 小红书文案生成 ============
+# ============ 文案整理 ============
 
 def build_xiaohongshu_post(recipe: dict) -> str:
     """构建完整的小红书发布文案"""
@@ -151,41 +152,48 @@ def run_daily_recipe():
     OUTPUT_DIR.mkdir(exist_ok=True)
     today = datetime.date.today().strftime("%Y-%m-%d")
     
-    print(f"🍳 [{today}] 开始生成今日菜谱...")
+    print(f"\n🍳 [{today}] 开始生成今日内容...")
     
     # 1. 加载历史，避免重复
     history = load_history()
     used_dishes = get_used_dishes(history)
-    print(f"📋 已有 {len(used_dishes)} 道菜历史记录，避免重复")
+    print(f"📋 已有 {len(used_dishes)} 道菜历史记录")
     
-    # 2. 生成菜谱
-    print("✍️  正在生成菜谱内容...")
-    recipe = generate_recipe(used_dishes)
-    print(f"✅ 今日菜谱：{recipe['dish_name']}")
-    
+    # 2. 生成菜谱内容
+    print("✍️ 正在构思菜谱文案...")
+    try:
+        recipe = generate_recipe(used_dishes)
+        print(f"✅ 今日菜谱：{recipe['dish_name']}")
+    except Exception as e:
+        print(f"❌ 菜谱文案生成失败: {e}")
+        return
+
     # 3. 生成图片
-    print("🎨 正在生成食物图片（DALL-E 3）...")
-    image_bytes = generate_recipe_image(recipe)
-    
-    # 4. 保存图片
-    image_path = OUTPUT_DIR / f"{today}_{recipe['dish_name']}.png"
-    with open(image_path, "wb") as f:
-        f.write(image_bytes)
-    print(f"💾 图片已保存：{image_path}")
-    
-    # 5. 生成文案
+    try:
+        print("🎨 正在绘制菜谱配图...")
+        image_bytes = generate_recipe_image(recipe)
+        
+        # 保存图片
+        image_path = OUTPUT_DIR / f"{today}_{recipe['dish_name']}.png"
+        with open(image_path, "wb") as f:
+            f.write(image_bytes)
+        print(f"💾 图片保存成功：{image_path}")
+    except Exception as e:
+        print(f"⚠️ 图片生成失败 (程序将继续生成文案): {e}")
+        image_path = "生成失败"
+
+    # 4. 保存文案
     post_text = build_xiaohongshu_post(recipe)
     text_path = OUTPUT_DIR / f"{today}_{recipe['dish_name']}_post.txt"
     with open(text_path, "w", encoding="utf-8") as f:
         f.write(post_text)
-    print(f"📝 文案已保存：{text_path}")
     
-    # 6. 保存完整菜谱 JSON
-    recipe_path = OUTPUT_DIR / f"{today}_{recipe['dish_name']}_recipe.json"
-    with open(recipe_path, "w", encoding="utf-8") as f:
+    # 5. 保存完整 JSON 记录
+    recipe_json_path = OUTPUT_DIR / f"{today}_{recipe['dish_name']}_recipe.json"
+    with open(recipe_json_path, "w", encoding="utf-8") as f:
         json.dump(recipe, f, ensure_ascii=False, indent=2)
     
-    # 7. 更新历史记录
+    # 6. 更新历史记录
     history.append({
         "date": today,
         "dish_name": recipe["dish_name"],
@@ -195,19 +203,12 @@ def run_daily_recipe():
     save_history(history)
     
     print(f"\n{'='*50}")
-    print(f"🎉 今日内容已生成完毕！")
+    print(f"🎉 今日内容生成完毕！")
     print(f"菜名：{recipe['dish_name']} {recipe['dish_emoji']}")
     print(f"标题：{recipe['xiaohongshu_title']}")
     print(f"{'='*50}\n")
-    print("📱 小红书文案预览：")
+    print("📱 文案预览：")
     print(post_text)
-    
-    return {
-        "recipe": recipe,
-        "image_path": str(image_path),
-        "post_text": post_text,
-        "date": today,
-    }
 
 if __name__ == "__main__":
     run_daily_recipe()
