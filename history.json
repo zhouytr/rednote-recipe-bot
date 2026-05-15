@@ -52,5 +52,11 @@
     "dish_name": "胡萝卜炒鸡蛋",
     "image_path": "生成失败",
     "post_path": "output/2026-05-14_胡萝卜炒鸡蛋_post.txt"
+  },
+  {
+    "date": "2026-05-15",
+    "dish_name": "蒜蓉炒菠菜",
+    "image_path": "生成失败",
+    "post_path": "output/2026-05-15_蒜蓉炒菠菜_post.txt"
   }
 ]
