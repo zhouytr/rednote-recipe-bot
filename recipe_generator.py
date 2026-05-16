@@ -27,7 +27,9 @@ OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "")
 # QQ 邮箱发件配置
 SENDER_EMAIL     = os.environ.get("SENDER_QQ_EMAIL",     "2760717022@qq.com")
 SENDER_AUTH_CODE = os.environ.get("SENDER_QQ_AUTH_CODE", "ehihntjmtzmdddca")
-RECEIVER_EMAIL   = os.environ.get("RECEIVER_EMAIL",       SENDER_EMAIL)   # 默认发给自己
+# RECEIVER_EMAIL 未设置时默认发给发件人自己（即 QQ 邮箱本身）
+_recv = os.environ.get("RECEIVER_EMAIL", "").strip()
+RECEIVER_EMAIL   = _recv if _recv else SENDER_EMAIL
 
 SMTP_HOST = "smtp.qq.com"
 SMTP_PORT = 465   # QQ 邮箱 SSL 端口
@@ -171,6 +173,10 @@ def _poll_result(result_url: str, headers: dict,
             continue
 
         if status in ("failed", "canceled", "error"):
+            err_msg = task.get("error", "") or data.get("message", "")
+            # 平台过载时抛出特定异常，让上层重试
+            if "overload" in err_msg.lower() or "try again" in err_msg.lower():
+                raise OverloadedError(f"平台过载: {err_msg}")
             raise Exception(f"任务失败 status={status}，响应: {data}")
 
         # processing / created / running → 继续等
@@ -179,10 +185,16 @@ def _poll_result(result_url: str, headers: dict,
     raise Exception(f"轮询超时（>{max_wait}s），任务未完成，放弃")
 
 
-def generate_recipe_image(recipe: dict) -> bytes:
+class OverloadedError(Exception):
+    """平台过载专用异常，触发等待重试"""
+    pass
+
+
+def generate_recipe_image(recipe: dict, max_overload_retries: int = 3) -> bytes:
     """
     提交图片生成任务并轮询结果，返回图片二进制数据。
-    优先使用 text-to-image，失败后自动降级到 image-edit。
+    - 优先 text-to-image，失败降级 image-edit
+    - 遇到平台过载（overloaded）自动等待 30s 后重试，最多 3 次
     """
     dish_name = recipe["dish_name"]
     tagline   = recipe.get("tagline", "")
@@ -222,40 +234,51 @@ def generate_recipe_image(recipe: dict) -> bytes:
         },
     ]
 
-    last_err = None
-    for ep in endpoints:
-        try:
-            print(f"🎨 提交生图任务（{ep['name']}）...")
-            resp = requests.post(ep["url"], headers=headers, json=ep["payload"], timeout=30)
-            print(f"   HTTP {resp.status_code}")
+    for overload_attempt in range(max_overload_retries):
+        last_err = None
+        for ep in endpoints:
+            try:
+                print(f"🎨 提交生图任务（{ep['name']}）...")
+                resp = requests.post(ep["url"], headers=headers, json=ep["payload"], timeout=30)
+                print(f"   HTTP {resp.status_code}")
 
-            if resp.status_code != 200:
-                print(f"   ❌ 提交失败: {resp.text[:300]}")
-                last_err = f"HTTP {resp.status_code}"
-                continue
+                if resp.status_code != 200:
+                    print(f"   ❌ 提交失败: {resp.text[:300]}")
+                    last_err = f"HTTP {resp.status_code}"
+                    continue
 
-            result = resp.json()
-            print(f"   提交响应: {json.dumps(result, ensure_ascii=False)[:300]}")
+                result = resp.json()
+                print(f"   提交响应: {json.dumps(result, ensure_ascii=False)[:300]}")
 
-            # 取轮询地址：优先 data.urls.get，其次根级别 urls.get
-            task_data  = result.get("data", result)
-            result_url = (
-                task_data.get("urls", {}).get("get")
-                or result.get("urls", {}).get("get")
-            )
+                # 取轮询地址：优先 data.urls.get，其次根级别 urls.get
+                task_data  = result.get("data", result)
+                result_url = (
+                    task_data.get("urls", {}).get("get")
+                    or result.get("urls", {}).get("get")
+                )
 
-            if not result_url:
-                raise Exception(f"未找到轮询 URL，响应: {result}")
+                if not result_url:
+                    raise Exception(f"未找到轮询 URL，响应: {result}")
 
-            print(f"   🔗 轮询地址: {result_url}")
-            return _poll_result(result_url, headers)
+                print(f"   🔗 轮询地址: {result_url}")
+                return _poll_result(result_url, headers)
 
-        except Exception as e:
-            print(f"   ⚠️ {ep['name']} 失败: {e}")
-            last_err = str(e)
-            time.sleep(3)
+            except OverloadedError as e:
+                print(f"   ⚠️ 平台过载（第 {overload_attempt+1}/{max_overload_retries} 次），等待 30s 后重试两个接口...")
+                last_err = str(e)
+                time.sleep(30)
+                break   # 跳出 endpoint 循环，进入下一轮 overload_attempt
 
-    raise Exception(f"所有图片接口均失败，最后错误: {last_err}")
+            except Exception as e:
+                print(f"   ⚠️ {ep['name']} 失败: {e}")
+                last_err = str(e)
+                time.sleep(3)
+
+        else:
+            # endpoint 循环正常结束（没有 break），说明两个接口都非过载失败
+            raise Exception(f"所有图片接口均失败，最后错误: {last_err}")
+
+    raise Exception(f"平台持续过载，{max_overload_retries} 次重试均失败，放弃生图")
 
 # ============ 文案构建 ============
 
@@ -385,6 +408,10 @@ def build_email_html(recipe: dict, today: str) -> str:
 
 def send_email(recipe: dict, image_bytes: bytes | None, today: str):
     """通过 QQ 邮箱 SMTP 发送 HTML 邮件，菜品图内嵌显示"""
+    if not RECEIVER_EMAIL:
+        raise ValueError("RECEIVER_EMAIL 未配置，无法发送邮件！请在 GitHub Secrets 中添加。")
+    if not SENDER_AUTH_CODE:
+        raise ValueError("SENDER_QQ_AUTH_CODE 未配置，无法登录 SMTP！")
     print(f"📧 正在发送邮件至 {RECEIVER_EMAIL} ...")
 
     msg = MIMEMultipart("related")
