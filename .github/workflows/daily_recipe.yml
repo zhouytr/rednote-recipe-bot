@@ -1,37 +1,51 @@
-name: 每日菜谱自动生成
+name: 每日菜谱生成
 
 on:
   schedule:
-    - cron: '40 0 * * *'  # UTC 0:40 = 北京 8:40
-  workflow_dispatch:  # 允许手动触发
+    # UTC 00:40 = 北京时间 08:40
+    - cron: '40 0 * * *'
+  workflow_dispatch:   # 允许手动触发，方便调试
 
 jobs:
   generate:
+    name: 生成今日菜谱
     runs-on: ubuntu-latest
+    timeout-minutes: 8   # ⏱️ 最长 8 分钟，防止图片轮询卡死整个 job
 
     steps:
-      - uses: actions/checkout@v4
+      - name: 检出代码
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: 设置 Python 3.11
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - run: pip install -r requirements.txt
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 恢复历史记录缓存
+        uses: actions/cache@v4
+        with:
+          path: history.json
+          key: recipe-history-${{ github.run_number }}
+          restore-keys: |
+            recipe-history-
 
       - name: 生成今日菜谱
+        timeout-minutes: 6   # ⏱️ 单步超时 6 分钟（图片轮询最长 90s，留足余量）
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
-          PUBLISH_STRATEGY: ${{ secrets.PUBLISH_STRATEGY }}
+          OPENAI_API_KEY:      ${{ secrets.OPENAI_API_KEY }}
+          SENDER_QQ_EMAIL:     ${{ secrets.SENDER_QQ_EMAIL }}
+          SENDER_QQ_AUTH_CODE: ${{ secrets.SENDER_QQ_AUTH_CODE }}
+          RECEIVER_EMAIL:      ${{ secrets.RECEIVER_EMAIL }}
         run: python recipe_generator.py
 
-      - name: 提交历史记录防重复
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email 'bot@github.com'
-
-          git add history.json
-
-          git diff --staged --quiet || git commit -m "更新菜谱历史"
-
-          git push
+      - name: 上传生成文件（供下载查看）
+        if: always()   # 即使失败也上传，方便排查
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-output-${{ github.run_number }}
+          path: output/
+          retention-days: 7
