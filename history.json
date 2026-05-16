@@ -70,5 +70,11 @@
     "dish_name": "豆腐皮炒韭菜",
     "image_path": "生成失败",
     "post_path": "output/2026-05-16_豆腐皮炒韭菜_post.txt"
+  },
+  {
+    "date": "2026-05-16",
+    "dish_name": "干煸四季豆",
+    "image_path": "生成失败",
+    "post_path": "output/2026-05-16_干煸四季豆_post.txt"
   }
 ]
