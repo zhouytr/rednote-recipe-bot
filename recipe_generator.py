@@ -124,38 +124,59 @@ def generate_recipe(used_dishes: list, max_retries: int = 3) -> dict:
 # 两个端点均走相同的异步流程，优先使用 text-to-image（无需传参考图，更稳定）
 
 def _poll_result(result_url: str, headers: dict,
-                 poll_interval: int = 5, max_wait: int = 180) -> bytes:
+                 poll_interval: int = 8, max_wait: int = 90) -> bytes:
     """
     轮询异步任务结果，返回图片二进制数据。
-    max_wait: 最长等待秒数（默认 3 分钟）
+    - poll_interval=8s，避免限流
+    - max_wait=90s，超时放弃，不阻塞 Actions
+    - 每次都打印完整响应，方便排查
     """
     waited = 0
     while waited < max_wait:
         time.sleep(poll_interval)
         waited += poll_interval
 
-        resp = requests.get(result_url, headers=headers, timeout=30)
-        if resp.status_code != 200:
-            print(f"   轮询非 200: {resp.status_code} - {resp.text[:200]}")
+        try:
+            resp = requests.get(result_url, headers=headers, timeout=30)
+        except Exception as e:
+            print(f"   轮询请求异常: {e}，继续等待...")
             continue
 
-        data = resp.json()
-        task = data.get("data", data)          # 兼容 {"data": {...}} 和直接是 {...}
-        status = task.get("status", "")
-        print(f"   ⏳ 轮询中... status={status}  已等待 {waited}s")
+        print(f"   [{waited}s] HTTP {resp.status_code} | 响应: {resp.text[:400]}")
+
+        if resp.status_code != 200:
+            continue
+
+        try:
+            data = resp.json()
+        except Exception:
+            print(f"   响应非 JSON，跳过")
+            continue
+
+        # 兼容 {"data": {"status":...}} 和直接 {"status":...}
+        task = data.get("data", data)
+        status = str(task.get("status", "")).lower()
 
         if status == "succeeded":
             outputs = task.get("outputs", [])
             if outputs:
                 img_url = outputs[0]
-                print(f"   ✅ 任务完成，下载图片: {img_url[:70]}...")
-                return requests.get(img_url, timeout=60).content
-            raise Exception("status=succeeded 但 outputs 为空")
+                print(f"   生图完成！下载: {img_url[:80]}...")
+                img_resp = requests.get(img_url, timeout=60)
+                if img_resp.status_code == 200:
+                    return img_resp.content
+                raise Exception(f"图片下载失败 HTTP {img_resp.status_code}")
+            # succeeded 但 outputs 还是空（平台偶发），再等一轮
+            print(f"   status=succeeded 但 outputs=[]，再等一轮...")
+            continue
 
-        if status in ("failed", "canceled"):
-            raise Exception(f"任务失败，status={status}，详情: {task}")
+        if status in ("failed", "canceled", "error"):
+            raise Exception(f"任务失败 status={status}，响应: {data}")
 
-    raise Exception(f"轮询超时（>{max_wait}s），任务未完成")
+        # processing / created / running → 继续等
+        print(f"   status={status}，继续等待...")
+
+    raise Exception(f"轮询超时（>{max_wait}s），任务未完成，放弃")
 
 
 def generate_recipe_image(recipe: dict) -> bytes:
