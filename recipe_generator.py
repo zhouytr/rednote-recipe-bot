@@ -1,11 +1,11 @@
 """
 小红书每日菜谱自动化生成器
 功能：
-- 每日 8:40 自动触发
+- 每日 8:40 自动触发（配合 cron / GitHub Actions）
 - 生成不重复的家常菜菜谱
 - 使用 gpt-image-2-plus image-edit 接口生成图片
 - 生成小红书格式文案
-- 输出内容供发布使用
+- 📧 自动发送精美 HTML 邮件到指定邮箱
 """
 
 import os
@@ -13,24 +13,36 @@ import json
 import base64
 import datetime
 import time
+import smtplib
 import requests
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
 from pathlib import Path
 from openai import OpenAI
 
-# ============ 配置区 ============
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OUTPUT_DIR = Path("./output")
+# ============ 配置区（优先读取环境变量，其次用下方默认值）============
+OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "")
+
+# QQ 邮箱发件配置
+SENDER_EMAIL     = os.environ.get("SENDER_QQ_EMAIL",     "2760717022@qq.com")
+SENDER_AUTH_CODE = os.environ.get("SENDER_QQ_AUTH_CODE", "ehihntjmtzmdddca")
+RECEIVER_EMAIL   = os.environ.get("RECEIVER_EMAIL",       SENDER_EMAIL)   # 默认发给自己
+
+SMTP_HOST = "smtp.qq.com"
+SMTP_PORT = 465   # QQ 邮箱 SSL 端口
+
+OUTPUT_DIR   = Path("./output")
 HISTORY_FILE = Path("./history.json")
 
 client = OpenAI(
     api_key=OPENAI_API_KEY,
-    base_url="https://api.gptsapi.net/v1"
+    base_url="https://api.gptsapi.net/v1",
 )
 
 # ============ 菜谱历史管理 ============
 
 def load_history() -> list:
-    """加载历史菜谱记录"""
     if HISTORY_FILE.exists():
         with open(HISTORY_FILE, "r", encoding="utf-8") as f:
             try:
@@ -40,18 +52,15 @@ def load_history() -> list:
     return []
 
 def save_history(history: list):
-    """保存历史菜谱记录"""
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 def get_used_dishes(history: list) -> list:
-    """获取已使用过的菜名"""
     return [item["dish_name"] for item in history]
 
 # ============ 菜谱生成 ============
 
 def generate_recipe(used_dishes: list, max_retries: int = 3) -> dict:
-    """使用 GPT-4o 生成今日菜谱内容，包含重试机制与 JSON 模式限制"""
     used_str = "、".join(used_dishes[-30:]) if used_dishes else "无"
 
     prompt = f"""你是一位专业的家常菜厨师，请生成一道适合普通家庭制作的中国家常菜菜谱。
@@ -60,7 +69,7 @@ def generate_recipe(used_dishes: list, max_retries: int = 3) -> dict:
 1. 不能是以下已使用过的菜：{used_str}
 2. 食材简单易得，步骤清晰
 3. 适合小红书风格（活泼、接地气）
-4. ⚠️ 必须严格遵守标准的单行 JSON 对象格式！如果 JSON 的字符串（如文案正文）中需要换行，请务必使用转义字符 \\n ，绝对不能在双引号内部直接按回车键换行！
+4. JSON 字符串中的换行必须用 \\n，不可直接回车
 
 请严格按照以下 JSON 格式返回，不要有任何其他文字：
 {{
@@ -87,166 +96,311 @@ def generate_recipe(used_dishes: list, max_retries: int = 3) -> dict:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.9,
             )
-
             raw = response.choices[0].message.content.strip()
-
-            # 去除可能的 markdown 代码块标识（双重保险）
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
                 if raw.lower().startswith("json"):
                     raw = raw[4:]
-
             return json.loads(raw.strip())
 
         except json.JSONDecodeError as e:
             print(f"⚠️ 第 {attempt + 1} 次 JSON 解析失败: {e}")
             if attempt == max_retries - 1:
-                raise Exception("多次重试后仍无法生成正确的 JSON，请检查 API 或 Prompt。")
+                raise Exception("多次重试后仍无法生成正确的 JSON。")
             time.sleep(2)
 
         except Exception as e:
-            print(f"⚠️ 第 {attempt + 1} 次 API 请求发生错误: {e}")
+            print(f"⚠️ 第 {attempt + 1} 次 API 请求失败: {e}")
             if attempt == max_retries - 1:
                 raise Exception("API 请求多次失败，请检查网络或余额。")
             time.sleep(3)
 
-# ============ 图片生成（image-edit / gpt-image-2-plus）============
+# ============ 图片生成（gpt-image-2-plus 异步轮询）============
+#
+# 该平台为【异步接口】，调用流程：
+#   Step 1: POST 提交任务 → 返回 task_id + result_url（status: "created"）
+#   Step 2: GET 轮询 result_url → 直到 status 变为 "succeeded"，outputs 里才有图片
+#
+# 两个端点均走相同的异步流程，优先使用 text-to-image（无需传参考图，更稳定）
 
-def generate_recipe_image(recipe: dict, max_retries: int = 3) -> bytes:
+def _poll_result(result_url: str, headers: dict,
+                 poll_interval: int = 5, max_wait: int = 180) -> bytes:
     """
-    使用 gpt-image-2-plus image-edit 接口生成菜谱图片。
+    轮询异步任务结果，返回图片二进制数据。
+    max_wait: 最长等待秒数（默认 3 分钟）
+    """
+    waited = 0
+    while waited < max_wait:
+        time.sleep(poll_interval)
+        waited += poll_interval
 
-    image-edit 需要传入至少一张参考图（images 数组）。
-    这里传入一张通用的食物场景图作为底图风格参考，
-    让模型根据 prompt 重新绘制指定菜品的专业美食摄影图。
+        resp = requests.get(result_url, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            print(f"   轮询非 200: {resp.status_code} - {resp.text[:200]}")
+            continue
 
-    如需用自己的底图，请将 SEED_IMAGE_URL 替换为可公网访问的图片链接。
+        data = resp.json()
+        task = data.get("data", data)          # 兼容 {"data": {...}} 和直接是 {...}
+        status = task.get("status", "")
+        print(f"   ⏳ 轮询中... status={status}  已等待 {waited}s")
+
+        if status == "succeeded":
+            outputs = task.get("outputs", [])
+            if outputs:
+                img_url = outputs[0]
+                print(f"   ✅ 任务完成，下载图片: {img_url[:70]}...")
+                return requests.get(img_url, timeout=60).content
+            raise Exception("status=succeeded 但 outputs 为空")
+
+        if status in ("failed", "canceled"):
+            raise Exception(f"任务失败，status={status}，详情: {task}")
+
+    raise Exception(f"轮询超时（>{max_wait}s），任务未完成")
+
+
+def generate_recipe_image(recipe: dict) -> bytes:
+    """
+    提交图片生成任务并轮询结果，返回图片二进制数据。
+    优先使用 text-to-image，失败后自动降级到 image-edit。
     """
     dish_name = recipe["dish_name"]
-    tagline = recipe.get("tagline", "")
+    tagline   = recipe.get("tagline", "")
 
-    # ── 端点 & 鉴权 ──────────────────────────────────────────
-    api_url = "https://api.gptsapi.net/api/v3/openai/gpt-image-2-plus/image-edit"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    # ── 参考底图（可替换为自己的食物摄影模板图）─────────────
-    # 要求：公网可访问、JPEG/PNG 均可
-    SEED_IMAGE_URL = "https://images.unsplash.com/photo-1504674900247-0877df9cc836?w=512&q=80"
-
-    # ── Prompt ────────────────────────────────────────────────
     image_prompt = (
         f"Professional Chinese food photography of {dish_name}. "
         f"{tagline}. "
-        "Beautifully plated dish on a wooden table, warm studio lighting, "
+        "Beautifully plated on a wooden table, warm studio lighting, "
         "shallow depth of field, 45-degree angle, vibrant appetizing colors, "
         "no text, no watermark, 4K quality."
     )
 
-    payload = {
-        "prompt": image_prompt,
-        "images": [SEED_IMAGE_URL],   # image-edit 必填字段
-        "output_format": "png",
-    }
+    # 优先用 text-to-image，失败再试 image-edit
+    endpoints = [
+        {
+            "name": "text-to-image",
+            "url":  "https://api.gptsapi.net/api/v3/openai/gpt-image-2-plus/text-to-image",
+            "payload": {
+                "prompt":        image_prompt,
+                "aspect_ratio":  "1:1",
+                "output_format": "png",
+            },
+        },
+        {
+            "name": "image-edit",
+            "url":  "https://api.gptsapi.net/api/v3/openai/gpt-image-2-plus/image-edit",
+            "payload": {
+                "prompt":        image_prompt,
+                "images":        ["https://images.unsplash.com/photo-1504674900247-0877df9cc836?w=512&q=80"],
+                "output_format": "png",
+            },
+        },
+    ]
 
-    for attempt in range(max_retries):
+    last_err = None
+    for ep in endpoints:
         try:
-            print(f"🎨 正在请求 image-edit 接口 (第 {attempt + 1}/{max_retries})...")
-            response = requests.post(api_url, headers=headers, json=payload, timeout=120)
+            print(f"🎨 提交生图任务（{ep['name']}）...")
+            resp = requests.post(ep["url"], headers=headers, json=ep["payload"], timeout=30)
+            print(f"   HTTP {resp.status_code}")
 
-            print(f"DEBUG - HTTP 状态码: {response.status_code}")
-
-            # 尝试解析 JSON，解析失败时打印原始文本
-            try:
-                result = response.json()
-            except Exception:
-                print(f"DEBUG - 响应非 JSON，原始内容: {response.text[:300]}")
-                raise Exception(f"接口返回非 JSON，状态码: {response.status_code}")
-
-            print(f"DEBUG - 平台返回完整 JSON: {result}")
-
-            if response.status_code != 200:
-                print(f"❌ 接口报错! 状态码: {response.status_code}")
-                print(f"❌ 响应内容: {response.text}")
-                if attempt < max_retries - 1:
-                    time.sleep(5)
+            if resp.status_code != 200:
+                print(f"   ❌ 提交失败: {resp.text[:300]}")
+                last_err = f"HTTP {resp.status_code}"
                 continue
 
-            # ── 解析返回结构（兼容多种格式）─────────────────
-            image_url = None
-            image_b64 = None
+            result = resp.json()
+            print(f"   提交响应: {json.dumps(result, ensure_ascii=False)[:300]}")
 
-            if "url" in result and str(result.get("url", "")).startswith("http"):
-                # 格式 A: 根级别直接有 url
-                image_url = result["url"]
+            # 取轮询地址：优先 data.urls.get，其次根级别 urls.get
+            task_data  = result.get("data", result)
+            result_url = (
+                task_data.get("urls", {}).get("get")
+                or result.get("urls", {}).get("get")
+            )
 
-            elif "data" in result and isinstance(result["data"], list) and result["data"]:
-                # 格式 B: 标准 OpenAI 风格 {"data": [{"url": ...}]}
-                image_url = result["data"][0].get("url")
-                image_b64 = result["data"][0].get("b64_json")
+            if not result_url:
+                raise Exception(f"未找到轮询 URL，响应: {result}")
 
-            elif "images" in result and isinstance(result["images"], list) and result["images"]:
-                # 格式 C: {"images": ["https://..." | "<base64>"]}
-                first = result["images"][0]
-                if isinstance(first, str) and first.startswith("http"):
-                    image_url = first
-                elif isinstance(first, str):
-                    image_b64 = first  # 纯 base64 字符串
-
-            # ── 下载或解码 ────────────────────────────────────
-            if image_url:
-                print(f"🔗 拿到图片链接，正在下载: {image_url[:70]}...")
-                img_data = requests.get(image_url, timeout=60).content
-                return img_data
-
-            if image_b64:
-                print("📜 拿到 Base64 数据，正在解码...")
-                return base64.b64decode(image_b64)
-
-            print(f"❓ 解析失败，未找到图片字段。原始响应: {result}")
-            raise Exception("未找到有效的图片数据字段")
+            print(f"   🔗 轮询地址: {result_url}")
+            return _poll_result(result_url, headers)
 
         except Exception as e:
-            print(f"⚠️ 第 {attempt + 1} 次生成捕获到异常: {str(e)}")
-            if attempt == max_retries - 1:
-                raise Exception("image-edit 接口多次尝试均失败，请检查 API Key 或余额。")
-            time.sleep(5)
+            print(f"   ⚠️ {ep['name']} 失败: {e}")
+            last_err = str(e)
+            time.sleep(3)
 
-# ============ 文案整理 ============
+    raise Exception(f"所有图片接口均失败，最后错误: {last_err}")
+
+# ============ 文案构建 ============
 
 def build_xiaohongshu_post(recipe: dict) -> str:
-    """构建完整的小红书发布文案"""
-    title = recipe["xiaohongshu_title"]
-    body = recipe["xiaohongshu_body"]
     tags = " ".join(recipe["tags"])
+    return (
+        f"{recipe['xiaohongshu_title']}\n\n"
+        f"{recipe['xiaohongshu_body']}\n\n"
+        f"{tags}\n#家常菜 #厨房日记 #简单美食 #每日菜谱"
+    )
 
-    post = f"""{title}
+# ============ 邮件发送 ============
 
-{body}
+def build_email_html(recipe: dict, today: str) -> str:
+    """生成精美的 HTML 邮件正文"""
+    ingredient_rows = "".join(
+        f"<tr>"
+        f"<td style='padding:8px 14px;border-bottom:1px solid #f5ebe0;'>{ing['name']}</td>"
+        f"<td style='padding:8px 14px;border-bottom:1px solid #f5ebe0;color:#c0392b;font-weight:600;'>{ing['amount']}</td>"
+        f"</tr>"
+        for ing in recipe["ingredients"]
+    )
 
-{tags}
-#家常菜 #厨房日记 #简单美食 #每日菜谱"""
+    step_items = "".join(
+        f"""<div style='display:flex;gap:14px;margin-bottom:16px;align-items:flex-start;'>
+              <div style='min-width:30px;height:30px;background:#e74c3c;color:white;border-radius:50%;
+                          font-weight:bold;font-size:14px;flex-shrink:0;line-height:30px;text-align:center;'>{s['step']}</div>
+              <div>
+                <div style='font-weight:600;color:#2c3e50;margin-bottom:3px;'>{s['action']}</div>
+                <div style='color:#666;font-size:14px;line-height:1.6;'>{s['detail']}</div>
+              </div>
+            </div>"""
+        for s in recipe["steps"]
+    )
 
-    return post
+    tip_items = "".join(
+        f"<li style='margin-bottom:7px;color:#555;font-size:14px;line-height:1.6;'>{tip}</li>"
+        for tip in recipe["tips"]
+    )
+
+    tag_spans = "".join(
+        f"<span style='background:#fff0f0;color:#e74c3c;border-radius:20px;padding:4px 11px;"
+        f"font-size:13px;margin:3px;display:inline-block;'>{tag}</span>"
+        for tag in recipe["tags"] + ["#家常菜", "#厨房日记", "#简单美食", "#每日菜谱"]
+    )
+
+    body_html = recipe["xiaohongshu_body"].replace("\n", "<br>")
+
+    return f"""<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#f8f4ef;font-family:'PingFang SC','Microsoft YaHei',sans-serif;">
+<div style="max-width:620px;margin:30px auto;background:white;border-radius:16px;
+            overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.10);">
+
+  <!-- 顶部 Banner -->
+  <div style="background:linear-gradient(135deg,#e74c3c 0%,#c0392b 100%);padding:30px 32px;text-align:center;">
+    <div style="font-size:12px;color:rgba(255,255,255,0.75);letter-spacing:3px;margin-bottom:10px;text-transform:uppercase;">
+      TODAY'S RECIPE · {today}
+    </div>
+    <div style="font-size:48px;margin-bottom:8px;">{recipe['dish_emoji']}</div>
+    <div style="font-size:28px;font-weight:700;color:white;margin-bottom:8px;">{recipe['dish_name']}</div>
+    <div style="display:inline-block;background:rgba(255,255,255,0.2);color:white;
+                border-radius:20px;padding:5px 16px;font-size:14px;">{recipe['tagline']}</div>
+  </div>
+
+  <!-- 菜品图片 -->
+  <div style="background:#fdf6f0;text-align:center;padding:24px 24px 8px;">
+    <img src="cid:recipe_image" alt="{recipe['dish_name']}"
+         style="max-width:100%;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,0.12);"
+         onerror="this.parentElement.style.display='none'">
+  </div>
+
+  <div style="padding:28px 32px;">
+
+    <!-- 食材清单 -->
+    <h2 style="font-size:17px;color:#2c3e50;border-left:4px solid #e74c3c;
+               padding-left:12px;margin:0 0 16px;">🛒 食材清单</h2>
+    <table style="width:100%;border-collapse:collapse;background:#fffaf7;
+                  border-radius:10px;overflow:hidden;margin-bottom:28px;font-size:14px;">
+      <thead>
+        <tr style="background:#e74c3c;">
+          <th style="padding:10px 14px;color:white;text-align:left;font-weight:600;">食材</th>
+          <th style="padding:10px 14px;color:white;text-align:left;font-weight:600;">用量</th>
+        </tr>
+      </thead>
+      <tbody>{ingredient_rows}</tbody>
+    </table>
+
+    <!-- 烹饪步骤 -->
+    <h2 style="font-size:17px;color:#2c3e50;border-left:4px solid #e74c3c;
+               padding-left:12px;margin:0 0 18px;">👨‍🍳 烹饪步骤</h2>
+    <div style="margin-bottom:28px;">{step_items}</div>
+
+    <!-- 小贴士 -->
+    <div style="background:#fffbf0;border:1px solid #fde3a7;border-radius:10px;
+                padding:16px 20px;margin-bottom:28px;">
+      <div style="font-weight:600;color:#d68910;margin-bottom:10px;font-size:15px;">💡 厨房小贴士</div>
+      <ul style="margin:0;padding-left:18px;">{tip_items}</ul>
+    </div>
+
+    <!-- 小红书文案 -->
+    <h2 style="font-size:17px;color:#2c3e50;border-left:4px solid #e74c3c;
+               padding-left:12px;margin:0 0 16px;">📱 小红书文案（复制即可发布）</h2>
+    <div style="background:#fff5f5;border:1px dashed #f1a1a1;border-radius:10px;
+                padding:20px;margin-bottom:20px;">
+      <div style="font-weight:700;font-size:16px;color:#c0392b;margin-bottom:12px;">
+        {recipe['xiaohongshu_title']}
+      </div>
+      <div style="color:#444;font-size:14px;line-height:1.9;">{body_html}</div>
+    </div>
+
+    <!-- 标签 -->
+    <div style="margin-bottom:28px;">{tag_spans}</div>
+
+    <hr style="border:none;border-top:1px solid #f0e6d3;margin:20px 0;">
+
+    <div style="text-align:center;color:#bbb;font-size:12px;line-height:1.8;">
+      🤖 由 AI 自动生成 &nbsp;·&nbsp; 每日 8:40 准时送达<br>
+      Powered by GPT-4o &amp; gpt-image-2-plus
+    </div>
+  </div>
+</div>
+</body>
+</html>"""
+
+
+def send_email(recipe: dict, image_bytes: bytes | None, today: str):
+    """通过 QQ 邮箱 SMTP 发送 HTML 邮件，菜品图内嵌显示"""
+    print(f"📧 正在发送邮件至 {RECEIVER_EMAIL} ...")
+
+    msg = MIMEMultipart("related")
+    msg["Subject"] = f"🍳 今日菜谱：{recipe['dish_name']} {recipe['dish_emoji']} | {today}"
+    msg["From"]    = f"每日菜谱机器人 <{SENDER_EMAIL}>"
+    msg["To"]      = RECEIVER_EMAIL
+
+    html_body = build_email_html(recipe, today)
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    if image_bytes:
+        img = MIMEImage(image_bytes, _subtype="png")
+        img.add_header("Content-ID", "<recipe_image>")
+        img.add_header("Content-Disposition", "inline", filename=f"{recipe['dish_name']}.png")
+        msg.attach(img)
+
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
+        server.login(SENDER_EMAIL, SENDER_AUTH_CODE)
+        server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
+
+    print(f"✅ 邮件发送成功！收件人：{RECEIVER_EMAIL}")
 
 # ============ 主流程 ============
 
 def run_daily_recipe():
-    """每日执行的主函数"""
     OUTPUT_DIR.mkdir(exist_ok=True)
     today = datetime.date.today().strftime("%Y-%m-%d")
 
     print(f"\n🍳 [{today}] 开始生成今日内容...")
 
-    # 1. 加载历史，避免重复
-    history = load_history()
+    # 1. 历史记录防重复
+    history     = load_history()
     used_dishes = get_used_dishes(history)
     print(f"📋 已有 {len(used_dishes)} 道菜历史记录")
 
-    # 2. 生成菜谱内容
-    print("✍️ 正在构思菜谱文案...")
+    # 2. 生成菜谱文案
+    print("✍️  正在构思菜谱文案...")
     try:
         recipe = generate_recipe(used_dishes)
         print(f"✅ 今日菜谱：{recipe['dish_name']}")
@@ -254,45 +408,53 @@ def run_daily_recipe():
         print(f"❌ 菜谱文案生成失败: {e}")
         return
 
-    # 3. 生成图片（image-edit）
-    image_path = "生成失败"
+    # 3. 生成配图
+    image_bytes = None
+    image_path  = "生成失败"
     try:
-        print("🎨 正在绘制菜谱配图（image-edit）...")
+        print("🎨 正在绘制菜谱配图...")
         image_bytes = generate_recipe_image(recipe)
-        image_path = OUTPUT_DIR / f"{today}_{recipe['dish_name']}.png"
+        image_path  = OUTPUT_DIR / f"{today}_{recipe['dish_name']}.png"
         with open(image_path, "wb") as f:
             f.write(image_bytes)
-        print(f"💾 图片保存成功：{image_path}")
+        print(f"💾 图片已保存：{image_path}")
     except Exception as e:
-        print(f"⚠️ 图片生成失败（程序将继续生成文案）: {e}")
+        print(f"⚠️ 图片生成失败（继续生成文案和邮件）: {e}")
 
-    # 4. 保存文案
+    # 4. 保存文案 & JSON
     post_text = build_xiaohongshu_post(recipe)
     text_path = OUTPUT_DIR / f"{today}_{recipe['dish_name']}_post.txt"
     with open(text_path, "w", encoding="utf-8") as f:
         f.write(post_text)
 
-    # 5. 保存完整 JSON 记录
     recipe_json_path = OUTPUT_DIR / f"{today}_{recipe['dish_name']}_recipe.json"
     with open(recipe_json_path, "w", encoding="utf-8") as f:
         json.dump(recipe, f, ensure_ascii=False, indent=2)
 
-    # 6. 更新历史记录
+    # 5. 📧 发送邮件
+    try:
+        send_email(recipe, image_bytes, today)
+    except Exception as e:
+        print(f"❌ 邮件发送失败: {e}")
+        print("   检查：① QQ 邮箱是否开启 SMTP 服务 ② 授权码是否正确")
+
+    # 6. 更新历史
     history.append({
-        "date": today,
-        "dish_name": recipe["dish_name"],
+        "date":       today,
+        "dish_name":  recipe["dish_name"],
         "image_path": str(image_path),
-        "post_path": str(text_path),
+        "post_path":  str(text_path),
     })
     save_history(history)
 
-    print(f"\n{'='*50}")
+    print(f"\n{'='*52}")
     print(f"🎉 今日内容生成完毕！")
-    print(f"菜名：{recipe['dish_name']} {recipe['dish_emoji']}")
-    print(f"标题：{recipe['xiaohongshu_title']}")
-    print(f"{'='*50}\n")
+    print(f"   菜名：{recipe['dish_name']} {recipe['dish_emoji']}")
+    print(f"   标题：{recipe['xiaohongshu_title']}")
+    print(f"{'='*52}\n")
     print("📱 文案预览：")
     print(post_text)
+
 
 if __name__ == "__main__":
     run_daily_recipe()
